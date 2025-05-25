@@ -2,6 +2,8 @@
 
 A minimal Go CLI tool that caches API responses to avoid hitting rate limits and speed up development.
 
+_Fully cooked by Claude._
+
 ## Usage
 
 ```bash
