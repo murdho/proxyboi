@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,11 @@ import (
 )
 
 const cacheDir = "./cache"
+
+type CacheEntry struct {
+	Data         []byte `json:"data"`
+	WasGzipped   bool   `json:"was_gzipped"`
+}
 
 func main() {
 	if len(os.Args) < 3 {
@@ -52,9 +58,12 @@ func main() {
 			}
 			resp.Body.Close()
 
+			// Check if response was gzipped
+			wasGzipped := strings.Contains(resp.Header.Get("Content-Encoding"), "gzip")
+			
 			// Decompress if gzipped
 			var jsonData []byte
-			if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+			if wasGzipped {
 				reader, err := gzip.NewReader(bytes.NewReader(body))
 				if err != nil {
 					return err
@@ -68,10 +77,15 @@ func main() {
 				jsonData = body
 			}
 
-			// Cache the decompressed JSON
+			// Cache the entry with compression info
+			cacheEntry := CacheEntry{
+				Data:       jsonData,
+				WasGzipped: wasGzipped,
+			}
+			cacheData, _ := json.Marshal(cacheEntry)
 			cacheKey := getCacheKey(resp.Request)
 			cachePath := filepath.Join(cacheDir, cacheKey+".json")
-			os.WriteFile(cachePath, jsonData, 0644)
+			os.WriteFile(cachePath, cacheData, 0644)
 
 			// Restore the response body (original compressed if it was compressed)
 			resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -87,12 +101,24 @@ func main() {
 			cacheKey := getCacheKey(r)
 			cachePath := filepath.Join(cacheDir, cacheKey+".json")
 			
-			if data, err := os.ReadFile(cachePath); err == nil {
-				fmt.Printf("Cache HIT: %s %s\n", r.Method, r.URL.String())
-				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("X-Cache", "HIT")
-				w.Write(data)
-				return
+			if cacheData, err := os.ReadFile(cachePath); err == nil {
+				var cacheEntry CacheEntry
+				if json.Unmarshal(cacheData, &cacheEntry) == nil {
+					fmt.Printf("Cache HIT: %s %s\n", r.Method, r.URL.String())
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Cache", "HIT")
+					
+					// Only compress if original API used gzip AND client accepts it
+					if cacheEntry.WasGzipped && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+						w.Header().Set("Content-Encoding", "gzip")
+						gzWriter := gzip.NewWriter(w)
+						defer gzWriter.Close()
+						gzWriter.Write(cacheEntry.Data)
+					} else {
+						w.Write(cacheEntry.Data)
+					}
+					return
+				}
 			}
 			
 			fmt.Printf("Cache MISS: %s %s\n", r.Method, r.URL.String())
