@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const cacheDir = "./cache"
@@ -42,7 +44,7 @@ func main() {
 
 	// Override ModifyResponse to cache responses
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		if resp.StatusCode == 200 {
+		if resp.StatusCode == 200 && isIdempotent(resp.Request.Method) {
 			// Read the response body
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
@@ -50,12 +52,28 @@ func main() {
 			}
 			resp.Body.Close()
 
-			// Cache the response
-			cacheKey := getCacheKey(resp.Request)
-			cachePath := filepath.Join(cacheDir, cacheKey)
-			os.WriteFile(cachePath, body, 0644)
+			// Decompress if gzipped
+			var jsonData []byte
+			if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+				reader, err := gzip.NewReader(bytes.NewReader(body))
+				if err != nil {
+					return err
+				}
+				defer reader.Close()
+				jsonData, err = io.ReadAll(reader)
+				if err != nil {
+					return err
+				}
+			} else {
+				jsonData = body
+			}
 
-			// Restore the response body
+			// Cache the decompressed JSON
+			cacheKey := getCacheKey(resp.Request)
+			cachePath := filepath.Join(cacheDir, cacheKey+".json")
+			os.WriteFile(cachePath, jsonData, 0644)
+
+			// Restore the response body (original compressed if it was compressed)
 			resp.Body = io.NopCloser(bytes.NewReader(body))
 			resp.ContentLength = int64(len(body))
 		}
@@ -63,20 +81,27 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Check cache first
-		cacheKey := getCacheKey(r)
-		cachePath := filepath.Join(cacheDir, cacheKey)
-		
-		if data, err := os.ReadFile(cachePath); err == nil {
-			fmt.Printf("Cache HIT: %s %s\n", r.Method, r.URL.String())
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Cache", "HIT")
-			w.Write(data)
-			return
+		// Only cache idempotent methods
+		if isIdempotent(r.Method) {
+			// Check cache first
+			cacheKey := getCacheKey(r)
+			cachePath := filepath.Join(cacheDir, cacheKey+".json")
+			
+			if data, err := os.ReadFile(cachePath); err == nil {
+				fmt.Printf("Cache HIT: %s %s\n", r.Method, r.URL.String())
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Cache", "HIT")
+				w.Write(data)
+				return
+			}
+			
+			fmt.Printf("Cache MISS: %s %s\n", r.Method, r.URL.String())
+			w.Header().Set("X-Cache", "MISS")
+		} else {
+			fmt.Printf("No cache (non-idempotent): %s %s\n", r.Method, r.URL.String())
+			w.Header().Set("X-Cache", "SKIP")
 		}
 
-		fmt.Printf("Cache MISS: %s %s\n", r.Method, r.URL.String())
-		w.Header().Set("X-Cache", "MISS")
 		proxy.ServeHTTP(w, r)
 	})
 
@@ -89,4 +114,8 @@ func getCacheKey(r *http.Request) string {
 	key := fmt.Sprintf("%s_%s_%s", r.Method, r.URL.Path, r.URL.RawQuery)
 	hash := md5.Sum([]byte(key))
 	return fmt.Sprintf("%x", hash)
+}
+
+func isIdempotent(method string) bool {
+	return method == "GET" || method == "HEAD"
 }
